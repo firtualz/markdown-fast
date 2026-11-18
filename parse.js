@@ -3,6 +3,8 @@
 // Written from scratch by studying marked's *behavior* (black-box probing);
 // no marked source was copied. Single-pass index scanner, direct HTML
 // emission, no token tree, no caching across calls.
+// Skill build 2026-11-18: + list-item quirks (4+ indented continuation
+// lines, lazy tables, lazy lines into nested items) found by fuzzing.
 
 const SP = 32, TAB = 9, NL = 10, CR = 13, FF = 12;
 
@@ -1859,6 +1861,19 @@ function endsWithPara(b, refs) {
   return false;
 }
 
+// marked quirk: a lazy table (header + delimiter at indent < 4, then body
+// rows) continues a paragraph inside a blockquote or list item and becomes
+// a table there. Returns the end index of the run, or -1.
+function lazyTableEnd(lines, j, hi) {
+  if (j + 1 >= hi || indentCols(lines[j]) >= 4 || indentCols(lines[j + 1]) >= 4) return -1;
+  if (lines[j].indexOf('|') < 0 || lines[j + 1].indexOf('|') < 0) return -1;
+  const aligns = tableDelimAligns(lines[j + 1]);
+  if (!aligns || splitTableRow(lines[j]).length !== aligns.length) return -1;
+  let k = j + 2;
+  while (k < hi && !isBlankLine(lines[k]) && indentCols(lines[k]) < 4 && !isLazyInterrupting(lines[k])) k++;
+  return k;
+}
+
 // A lazy line must not start an interrupting block (ATX, fence, thematic
 // break, blockquote, list, HTML 1-6). '===' is allowed (literal text);
 // '---' is a thematic break, so it is not allowed.
@@ -1924,6 +1939,8 @@ function collectBlockquote(lines, i, hi, refs, atEnd) {
       // the paragraph's line (never a new block start)
       if (bqLines.length > 0 && !isBlankLine(bqLines[bqLines.length - 1]) &&
           blockEndsWithPara(bqLines, refs) && !isLazyInterrupting(line)) {
+        const te = lazyTableEnd(lines, j, hi);
+        if (te > 0) { while (j < te) bqLines.push(lines[j++]); continue; }
         const ind = indentCols(line);
         let stripped = ind >= 4 ? stripCols(line, 4) : line;
         // a lazy setext-underline candidate gets 4 spaces prepended
@@ -1954,6 +1971,7 @@ function collectList(lines, i, hi, refs, atEnd) {
   const flushItem = () => {
     if (!cur) return;
     while (cur.lines.length > 0 && cur.lines[cur.lines.length - 1] === '') cur.lines.pop();
+    if (cur.blankAfter) cur.lines.blankAfter = true;
     items.push(cur.lines); // keep empty items: they render as <li></li>
     cur = null;
   };
@@ -1971,10 +1989,10 @@ function collectList(lines, i, hi, refs, atEnd) {
     if (cur && indent < cur.indent && isThematicBreak(line)) break;
     // new item of this list?
     if (cur && lm && sameType(lm) && indent < cur.indent) {
-      if (pendingBlanks > 0) loose = true;
+      if (pendingBlanks > 0) { loose = true; if (cur && pendingBlanks === 1) cur.blankAfter = true; }
       flushItem();
       pendingBlanks = 0;
-      cur = { lines: [], indent: lm.contentIndent, lastPara: false };
+      cur = { lines: [], indent: lm.contentIndent, lastPara: false, nestedStart: false, blankAfter: false };
       // first line of the new item
       if (lm.contentStart >= 0) {
         cur.lines.push(stripNCols(line, lm.contentIndent));
@@ -1987,7 +2005,7 @@ function collectList(lines, i, hi, refs, atEnd) {
     }
     if (!cur) {
       // first item
-      cur = { lines: [], indent: first.contentIndent, lastPara: false };
+      cur = { lines: [], indent: first.contentIndent, lastPara: false, nestedStart: false, blankAfter: false };
       if (first.contentStart >= 0) {
         cur.lines.push(stripNCols(line, first.contentIndent));
         cur.lastPara = true;
@@ -2005,11 +2023,20 @@ function collectList(lines, i, hi, refs, atEnd) {
       if (pendingBlanks > 0 && cur.lines.length === 0) break;
       // (looseness is computed from the item's parsed blocks, not here:
       // blank lines inside a nested container must not loosen this list)
+      const run4 = pendingBlanks === 0 && cur.lastPara;
       while (pendingBlanks > 0) { cur.lines.push(''); pendingBlanks--; }
-      cur.lines.push(stripNCols(line, cur.indent));
+      const itemLine = stripNCols(line, cur.indent);
+      cur.lines.push(itemLine);
+      // marked quirk: after a paragraph line indented 4+ inside the item,
+      // lazy continuation stops
+      if (run4 && indentCols(itemLine) >= 4) { cur.lastPara = false; j++; continue; }
       // update lastPara: a plain line means paragraph; a block start means not
       cur.lastPara = !isInterruptingBlock(line) && setextChar(line) === null &&
         matchFence(line) === null && !isThematicBreak(line);
+      // a nested list item / quote that starts with a paragraph can take
+      // lazy lines too (they go to the nested paragraph)
+      // (decided lazily, only if a lazy line actually follows)
+      cur.nestedStart = !cur.lastPara && (matchList(itemLine) !== null || isBqStart(itemLine));
       // a setext underline or table delimiter ends the paragraph
       if (setextChar(line) !== null) cur.lastPara = false;
       j++;
@@ -2017,10 +2044,16 @@ function collectList(lines, i, hi, refs, atEnd) {
     }
     // lazy continuation line (indent < contentIndent): it continues the
     // current paragraph, so merge it into the paragraph's line
+    if (pendingBlanks === 0 && !cur.lastPara && cur.nestedStart && !isLazyInterrupting(line)) {
+      cur.nestedStart = false;
+      cur.lastPara = blockEndsWithPara(cur.lines, refs);
+    }
     if (pendingBlanks === 0 && cur.lastPara && !isLazyInterrupting(line) &&
         setextChar(line) !== '=') {
       // '---' is a thematic break (isLazyInterrupting covers it); '===' is
       // literal text, so it is allowed as a lazy line
+      const te = lazyTableEnd(lines, j, hi);
+      if (te > 0) { while (j < te) cur.lines.push(lines[j++]); cur.lastPara = false; continue; }
       const ind = indentCols(line);
       let stripped = ind >= 4 ? stripCols(line, 4) : line;
       if (setextChar(stripped)) stripped = '    ' + stripped;
@@ -2046,6 +2079,8 @@ function collectList(lines, i, hi, refs, atEnd) {
 // tables. Returns {nodes, next}.
 function collectParagraph(lines, i, hi, refs, inListItem = false) {
   const paraLines = [lines[i]];
+  let run4 = false, cut = false, stripped = false;
+  const rawLines = [lines[i]];
   let j = i + 1;
   let tableAt = -1; // index in paraLines of the table header, if a table follows
   while (j < hi) {
@@ -2058,6 +2093,7 @@ function collectParagraph(lines, i, hi, refs, inListItem = false) {
       // literal text and collection continues
       const soFar = parseRefDefs(paraLines.join('\n'), refs);
       if (soFar.trim() !== '') {
+        if (stripped) { paraLines.length = 0; for (const r of rawLines) paraLines.push(r); run4 = false; }
         paraLines.push(line);
         j++;
         break; // setext heading: paragraph ends here
@@ -2074,10 +2110,25 @@ function collectParagraph(lines, i, hi, refs, inListItem = false) {
         break;
       }
     }
-    if (isInterruptingBlock(line, inListItem)) break;
-    paraLines.push(line);
+    if (isInterruptingBlock(line, inListItem)) { cut = true; break; }
+    // marked quirk: inside a list item, a continuation line indented 4+
+    // columns (after the item's content indent) loses 4 columns, and the
+    // run of such lines keeps its line end (an extra '\n' before the next
+    // line, or before </p> when the run ends the item)
+    if (inListItem && indentCols(line) >= 4) {
+      paraLines.push(stripCols(line, 4));
+      rawLines.push(line);
+      run4 = true; stripped = true;
+    } else {
+      if (run4) paraLines.push('');
+      run4 = false;
+      paraLines.push(line);
+      rawLines.push(line);
+    }
     j++;
   }
+  const trailNl = run4 && j >= hi;
+  const cutNl = run4 && cut && inListItem; // run4 ended by an interrupting block
   const nodes = [];
   if (tableAt >= 0) {
     // lines before the header form their own paragraph (if any)
@@ -2121,7 +2172,7 @@ function collectParagraph(lines, i, hi, refs, inListItem = false) {
   }
   const text = paraLines.join('\n');
   const rest = parseRefDefs(text, refs);
-  if (rest.trim() !== '') nodes.push({ t: 'para', text: rest });
+  if (rest.trim() !== '') nodes.push(trailNl ? { t: 'para', text: rest, trailNl: true } : cutNl ? { t: 'para', text: rest, cutNl: true } : { t: 'para', text: rest });
   return { nodes, next: j };
 }
 
@@ -2344,9 +2395,9 @@ function renderBlocks(blocks, refs, tightList) {
               const txt = (bi === 0 && checkbox) ? checkbox.rest : ib.text;
               const rendered = parseInline(txt, refs);
               if (tight) {
-                out += (bi === 0 && checkbox) ? checkbox.box + rendered : rendered;
+                out += ((bi === 0 && checkbox) ? checkbox.box + rendered : rendered) + (ib.cutNl ? '\n' : '');
               } else {
-                out += '<p>' + ((bi === 0 && checkbox) ? checkbox.box + rendered : rendered) + '</p>\n';
+                out += '<p>' + ((bi === 0 && checkbox) ? checkbox.box + rendered : rendered) + ((ib.trailNl && b.items[ii].blankAfter) || ib.cutNl ? '\n' : '') + '</p>\n';
               }
             } else {
               out += renderBlocks([ib], refs, false);
